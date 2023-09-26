@@ -21,7 +21,7 @@
         pkgs,
         system,
         ...
-      }: {
+      }: rec {
         packages.default = pkgs.hello;
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [nil.packages."${system}".default alejandra git gitg] ++ packages.default.buildInputs ++ packages.default.nativeBuildInputs ++ packages.default.propagatedBuildInputs;
