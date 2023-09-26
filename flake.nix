@@ -28,12 +28,5 @@
         };
         formatter = pkgs.alejandra;
       };
-      flake = {
-        templates.default = {
-          path = ./template;
-          description = "A template for Nix projects with good design and VSCode integration";
-          welcomeText = "";
-        };
-      };
     };
 }
