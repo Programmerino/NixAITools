@@ -3,13 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs";
-    nil.url = "github:oxalica/nil";
-    nil.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = inputs @ {
     flake-parts,
-    nil,
     ...
   }:
     flake-parts.lib.mkFlake {inherit inputs;} {
@@ -24,7 +21,7 @@
       }: rec {
         packages.default = pkgs.hello;
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [nil.packages."${system}".default alejandra git gitg] ++ packages.default.buildInputs ++ packages.default.nativeBuildInputs ++ packages.default.propagatedBuildInputs;
+          packages = with pkgs; [nil alejandra git gitg] ++ packages.default.buildInputs ++ packages.default.nativeBuildInputs ++ packages.default.propagatedBuildInputs;
         };
         formatter = pkgs.alejandra;
       };
