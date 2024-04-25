@@ -1,6 +1,15 @@
 {
   description = "Nix Template";
 
+  nixConfig = {
+    extra-substituters = [
+      "https://programmerino.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "programmerino.cachix.org-1:v8UWI2QVhEnoU71CDRNS/K1CcW3yzrQxJc604UiijjA="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs";
   };
