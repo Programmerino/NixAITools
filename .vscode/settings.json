@@ -1,7 +1,7 @@
 {
   "nix.enableLanguageServer": true,
   "nix.serverPath": "nil",
-  "nixEnvSelector.nixFile": "${workspaceRoot}/shell.nix",
+  "nixEnvSelector.nixFile": "${workspaceFolder}/shell.nix",
   "nix.serverSettings": {
     "nil": {
       "formatting": {
@@ -11,5 +11,16 @@
       }
     }
   },
-  "editor.formatOnSave": true
+  "editor.formatOnSave": true,
+  "terminal.integrated.defaultProfile.linux": "zsh",
+  "terminal.integrated.profiles.linux": {
+    "zsh": {
+      "path": "nix",
+      "args": [
+        "develop",
+        "-c",
+        "zsh"
+      ]
+    }
+  }
 }
