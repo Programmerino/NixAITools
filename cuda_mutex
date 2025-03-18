@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+
+"""
+CUDA VRAM Mutex - Intelligent VRAM Resource Manager for CUDA Applications
+
+This script serves as a VRAM resource manager for CUDA applications, ensuring efficient
+and safe allocation of GPU memory across multiple processes. It acts as a mutex (mutual
+exclusion) mechanism that guarantees a specified amount of VRAM is available before
+launching a CUDA application.
+
+Key features:
+1. Reservation System: Tracks VRAM reservations across multiple concurrent processes
+2. Process Monitoring: Continuously polls actual VRAM usage of running processes
+3. Dynamic Adjustment: Updates reservations if a process exceeds its initial allocation
+4. Usage Reporting: Reports maximum observed VRAM usage when a process exits
+5. Multi-GPU Support: Works with multiple NVIDIA GPUs
+
+How it works:
+1. Uses NVML (NVIDIA Management Library) to query GPU memory information
+2. Maintains a shared state file to track reserved VRAM across processes
+3. Waits until requested VRAM is available before launching the application
+4. Monitors the application's actual VRAM usage in a background thread
+5. If usage exceeds the reservation, dynamically updates the reservation
+6. Cleans up reservations when processes terminate
+
+Example usage:
+  cuda_mutex 5G -- my_cuda_application arg1 arg2
+  cuda_mutex -d 1 -t 300 -v 10G -- my_cuda_application --with-args
+
+This approach ensures maximum GPU utilization without over-allocation, even when
+applications don't instantly allocate their full VRAM requirements. The script accounts
+for the fact that naively checking available VRAM is insufficient, as multiple processes
+might be waiting to allocate memory simultaneously.
+"""
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+import fcntl
+import json
+import atexit
+import threading
+from pathlib import Path
+
+try:
+    import pynvml
+except ImportError:
+    print("Error: pynvml library not found. Please install it with 'pip install nvidia-ml-py3'")
+    sys.exit(1)
+
+# Global constants
+BASE_DIR = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp'))
+LOCK_FILE = BASE_DIR / "cuda_mutex.lock"
+STATE_FILE = BASE_DIR / "cuda_mutex.json"
+UPDATE_INTERVAL = 1  # seconds
+
+# Global variables
+verbose = False
+quiet = False
+max_vram_usage = 0
+
+
+def parse_size(size_str):
+    """Parse a size string like '5G' into bytes."""
+    if not size_str:
+        return 0
+
+    size_str = size_str.upper()
+    if size_str.endswith('G'):
+        return int(float(size_str[:-1]) * 1024 * 1024 * 1024)
+    elif size_str.endswith('M'):
+        return int(float(size_str[:-1]) * 1024 * 1024)
+    elif size_str.endswith('K'):
+        return int(float(size_str[:-1]) * 1024)
+    else:
+        try:
+            return int(size_str)
+        except ValueError:
+            raise ValueError(f"Invalid size format: {size_str}")
+
+
+def format_size(size_bytes):
+    """Format bytes into a human-readable string."""
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f}G"
+    elif size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f}M"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f}K"
+    else:
+        return f"{size_bytes}B"
+
+
+def log(message):
+    """Log a message if verbose mode is enabled."""
+    if verbose and not quiet:
+        print(f"[cuda_mutex] {message}")
+
+
+def message(message):
+    """Print a message unless quiet mode is enabled."""
+    if not quiet:
+        print(f"[cuda_mutex] {message}")
+
+
+def get_available_vram(device_index=0):
+    """Get the total available VRAM in bytes for the specified device."""
+    pynvml.nvmlInit()
+
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return info.free
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def get_device_count():
+    """Get the number of CUDA devices."""
+    pynvml.nvmlInit()
+
+    try:
+        return pynvml.nvmlDeviceGetCount()
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def get_device_name(device_index=0):
+    """Get the name of the specified CUDA device."""
+    pynvml.nvmlInit()
+
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        name = pynvml.nvmlDeviceGetName(handle)
+        # Handle both string and bytes return types
+        if isinstance(name, bytes):
+            return name.decode('utf-8')
+        return name  # Already a string
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def get_process_vram_usage(pid, device_index=0):
+    """Get the VRAM usage of a specific process on the specified device."""
+    pynvml.nvmlInit()
+
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+        # Get process info
+        process_info = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+
+        # Check if our process is using the GPU
+        for proc in process_info:
+            if proc.pid == pid:
+                return proc.usedGpuMemory
+
+        # Process not found in GPU processes
+        return 0
+    except Exception as e:
+        log(f"Error getting VRAM usage: {e}")
+        return 0
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def acquire_lock(lock_file):
+    """Acquire an exclusive lock on the lock file."""
+    os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+    lock_fd = open(lock_file, 'w+')
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    return lock_fd
+
+
+def release_lock(lock_fd):
+    """Release the lock on the lock file."""
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    lock_fd.close()
+
+
+def get_state():
+    """Get the current state of reserved VRAM."""
+    if not os.path.exists(STATE_FILE):
+        device_count = get_device_count()
+        state = {'devices': {}}
+        for i in range(device_count):
+            state['devices'][str(i)] = {'reserved': 0, 'processes': {}}
+        return state
+
+    with open(STATE_FILE, 'r') as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            # If the state file is corrupted, create a new one
+            device_count = get_device_count()
+            state = {'devices': {}}
+            for i in range(device_count):
+                state['devices'][str(i)] = {'reserved': 0, 'processes': {}}
+            return state
+
+
+def save_state(state):
+    """Save the state of reserved VRAM to the state file."""
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+
+def cleanup_state():
+    """Cleanup the state by removing entries for processes that no longer exist."""
+    lock_fd = acquire_lock(LOCK_FILE)
+    try:
+        state = get_state()
+        updated = False
+
+        for device_id, device_state in state['devices'].items():
+            for pid_str, vram in list(device_state['processes'].items()):
+                pid = int(pid_str)
+                try:
+                    os.kill(pid, 0)  # Check if process exists
+                except OSError:
+                    # Process doesn't exist
+                    log(f"Cleaning up process {pid} with {format_size(vram)} VRAM on GPU {device_id}")
+                    del device_state['processes'][pid_str]
+                    device_state['reserved'] -= vram
+                    updated = True
+
+        if updated:
+            save_state(state)
+    finally:
+        release_lock(lock_fd)
+
+
+def reserve_vram(vram_bytes, device_index=0):
+    """Reserve VRAM for the current process on the specified device."""
+    pid = os.getpid()
+    device_id = str(device_index)
+
+    lock_fd = acquire_lock(LOCK_FILE)
+    try:
+        state = get_state()
+
+        if device_id not in state['devices']:
+            state['devices'][device_id] = {'reserved': 0, 'processes': {}}
+
+        device_state = state['devices'][device_id]
+        device_state['reserved'] += vram_bytes
+        device_state['processes'][str(pid)] = vram_bytes
+
+        save_state(state)
+    finally:
+        release_lock(lock_fd)
+
+
+def update_vram_reservation(old_vram, new_vram, device_index=0):
+    """Update the VRAM reservation for the current process."""
+    pid = str(os.getpid())
+    device_id = str(device_index)
+
+    lock_fd = acquire_lock(LOCK_FILE)
+    try:
+        state = get_state()
+
+        if device_id in state['devices']:
+            device_state = state['devices'][device_id]
+
+            if pid in device_state['processes']:
+                device_state['reserved'] -= old_vram
+                device_state['reserved'] += new_vram
+                device_state['processes'][pid] = new_vram
+
+                save_state(state)
+    finally:
+        release_lock(lock_fd)
+
+
+def release_vram(device_index=0):
+    """Release VRAM reserved by the current process on the specified device."""
+    pid = str(os.getpid())
+    device_id = str(device_index)
+
+    lock_fd = acquire_lock(LOCK_FILE)
+    try:
+        state = get_state()
+
+        if device_id in state['devices']:
+            device_state = state['devices'][device_id]
+
+            if pid in device_state['processes']:
+                vram = device_state['processes'][pid]
+                log(f"Releasing {format_size(vram)} VRAM on GPU {device_id}")
+                device_state['reserved'] -= vram
+                del device_state['processes'][pid]
+
+                save_state(state)
+    finally:
+        release_lock(lock_fd)
+
+
+def wait_for_vram(required_vram, device_index=0, timeout=None, force=False):
+    """
+    Wait until the required amount of VRAM is available on the specified device.
+
+    Args:
+        required_vram: Required VRAM in bytes
+        device_index: CUDA device index
+        timeout: Timeout in seconds (None for no timeout)
+        force: If True, run even if there's not enough VRAM available
+
+    Returns:
+        True if VRAM is available, False if timeout occurred
+    """
+    device_id = str(device_index)
+    start_time = time.time()
+    waiting_message_shown = False
+
+    while True:
+        # Check timeout
+        if timeout is not None and time.time() - start_time > timeout:
+            log(f"Timeout waiting for VRAM on GPU {device_index}")
+            return False
+
+        # Clean up state first to remove dead processes
+        cleanup_state()
+
+        # Check available VRAM
+        available_vram = get_available_vram(device_index)
+
+        # Get current reserved VRAM
+        lock_fd = acquire_lock(LOCK_FILE)
+        try:
+            state = get_state()
+
+            if device_id not in state['devices']:
+                state['devices'][device_id] = {'reserved': 0, 'processes': {}}
+                save_state(state)
+
+            reserved_vram = state['devices'][device_id]['reserved']
+        finally:
+            release_lock(lock_fd)
+
+        # Calculate true available VRAM (accounting for reservations)
+        true_available = available_vram - reserved_vram
+
+        if true_available >= required_vram:
+            # Enough VRAM is available
+            return True
+
+        if force:
+            log(f"Forcing allocation of {format_size(required_vram)} VRAM on GPU {device_index} "
+                f"despite only {format_size(true_available)} being available")
+            return True
+
+        # Show waiting message only once
+        if not quiet and not waiting_message_shown:
+            print(f"Waiting for {format_size(required_vram)} VRAM on GPU {device_index} ({get_device_name(device_index)})... "
+                  f"(Available: {format_size(available_vram)}, "
+                  f"Reserved: {format_size(reserved_vram)}, "
+                  f"True Available: {format_size(true_available)})")
+            waiting_message_shown = True
+
+        # Sleep before next check
+        time.sleep(UPDATE_INTERVAL)
+
+
+def monitor_process_vram(process, required_vram, device_index):
+    """
+    Monitor the VRAM usage of a process and update the reservation if necessary.
+
+    Args:
+        process: The process to monitor
+        required_vram: The initially required VRAM in bytes
+        device_index: CUDA device index
+    """
+    global max_vram_usage
+    pid = process.pid
+    current_reservation = required_vram
+
+    while process.poll() is None:
+        # Get actual VRAM usage
+        usage = get_process_vram_usage(pid, device_index)
+
+        # Update max usage
+        if usage > max_vram_usage:
+            max_vram_usage = usage
+            log(f"Current VRAM usage: {format_size(usage)}")
+
+        # Check if more VRAM is being used than reserved
+        if usage > current_reservation:
+            # Update the reservation
+            message(f"Warning: Process is using {format_size(usage)} VRAM, "
+                   f"which exceeds the reserved {format_size(current_reservation)}")
+
+            # Calculate new reservation with some headroom (10% extra)
+            new_reservation = int(usage * 1.1)
+
+            # Update reservation
+            update_vram_reservation(current_reservation, new_reservation, device_index)
+            log(f"Updated reservation from {format_size(current_reservation)} to {format_size(new_reservation)}")
+
+            # Update current reservation
+            current_reservation = new_reservation
+
+        # Sleep before next check
+        time.sleep(UPDATE_INTERVAL)
+
+
+def run_command(command, required_vram, device_index=0, timeout=None, force=False):
+    """
+    Run the command, ensuring that the required VRAM is available on the specified device.
+
+    Args:
+        command: Command to run (list of strings)
+        required_vram: Required VRAM in bytes
+        device_index: CUDA device index
+        timeout: Timeout in seconds (None for no timeout)
+        force: If True, run even if there's not enough VRAM available
+    """
+    global max_vram_usage
+
+    # Wait for VRAM to be available
+    if not wait_for_vram(required_vram, device_index, timeout, force):
+        message(f"Timeout waiting for {format_size(required_vram)} VRAM on GPU {device_index}")
+        sys.exit(1)
+
+    # Reserve VRAM
+    reserve_vram(required_vram, device_index)
+    log(f"Reserved {format_size(required_vram)} VRAM on GPU {device_index} for process")
+
+    # Register cleanup functions
+    atexit.register(lambda: release_vram(device_index))
+
+    def signal_handler(sig, frame):
+        log(f"Received signal {sig}, cleaning up")
+        release_vram(device_index)
+        sys.exit(1)
+
+    for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+        signal.signal(sig, signal_handler)
+
+    # Set environment variables to tell the command which GPU to use
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = str(device_index)
+
+    # Run the command
+    try:
+        log(f"Running command: {' '.join(command)}")
+        process = subprocess.Popen(command, env=env)
+
+        # Start monitoring thread
+        monitor_thread = threading.Thread(
+            target=monitor_process_vram,
+            args=(process, required_vram, device_index),
+            daemon=True
+        )
+        monitor_thread.start()
+
+        # Wait for the process to complete
+        process.wait()
+
+        # Give the monitor thread time to do a final check
+        time.sleep(UPDATE_INTERVAL * 2)
+
+        # Report max VRAM usage
+        if max_vram_usage > 0:
+            message(f"Maximum VRAM usage: {format_size(max_vram_usage)} "
+                   f"({(max_vram_usage / required_vram * 100):.1f}% of requested {format_size(required_vram)})")
+    finally:
+        # Release VRAM
+        release_vram(device_index)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='CUDA VRAM mutex for running GPU applications')
+    parser.add_argument('size', help='Amount of VRAM to reserve (e.g., 5G, 500M)')
+    parser.add_argument('-d', '--device', type=int, default=0, help='CUDA device index (default: 0)')
+    parser.add_argument('-t', '--timeout', type=int, help='Timeout in seconds (default: none)')
+    parser.add_argument('-f', '--force', action='store_true', help='Force allocation even if there\'s not enough VRAM')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all non-error output')
+    parser.add_argument('command', nargs='+', help='Command to run')
+
+    args = parser.parse_args()
+
+    # Set global flags
+    global verbose, quiet
+    verbose = args.verbose
+    quiet = args.quiet
+
+    # Parse command (handling the -- separator)
+    if '--' in args.command:
+        separator_index = args.command.index('--')
+        command = args.command[separator_index + 1:]
+    else:
+        command = args.command
+
+    if not command:
+        parser.error("No command specified")
+
+    # Parse required VRAM
+    try:
+        required_vram = parse_size(args.size)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Run command
+    run_command(command, required_vram, args.device, args.timeout, args.force)
+
+
+if __name__ == "__main__":
+    main()

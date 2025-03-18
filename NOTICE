@@ -1,0 +1,13 @@
+NixAITools
+Copyright 2025 Davis Davalos-DeLosh
+
+This product includes software developed by Davis Davalos-DeLosh.
+
+This software includes code inspired by or references the following projects:
+- nixos-expose-cuda (https://github.com/ogoid/nixos-expose-cuda)
+
+This software depends on or includes portions of the following software:
+- pynvml (NVIDIA Management Library Python bindings)
+- huggingface-hub (Hugging Face's repository interface)
+
+Dependencies are subject to their respective licenses.
