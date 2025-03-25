@@ -34,6 +34,7 @@
             export HOME="$(mktemp -d)"
             ${if token != null then ''export HF_TOKEN="${token}"'' else ""}
             huggingface-cli download "${repo}" ${filesString} --repo-type "${repoType}" --quiet --local-dir "$out" --revision "${rev}"
+            rm -rf $out/.cache || true
           '';
         };
         cudaDerivation = {requiredSystemFeatures ? [], nativeBuildInputs ? [], buildPhase ? "", requiresVRAM ? null, cudaMutexOpts ? " ", ...}@args: pkgs.stdenv.mkDerivation ({
