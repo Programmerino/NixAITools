@@ -23,6 +23,11 @@
           outputHashAlgo = "sha256";
           outputHashMode = "recursive";
           outputHash = hash;
+
+          # Since datasets may contain nix store paths, we need to disable the references check.
+          __structuredAttrs = true;
+          unsafeDiscardReferences.out = true;
+
           installPhase = let
             filesString = if files != null then builtins.concatStringsSep " " files else "";
           in ''
