@@ -37,8 +37,9 @@
             rm -rf $out/.cache || true
           '';
         };
-        cudaDerivation = {requiredSystemFeatures ? [], nativeBuildInputs ? [], buildPhase ? "", requiresVRAM ? null, cudaMutexOpts ? " ", ...}@args: pkgs.stdenv.mkDerivation ({
-          requiredSystemFeatures = requiredSystemFeatures ++ ["expose-cuda"];
+        cudaDerivation = {name, requiredSystemFeatures ? [], nativeBuildInputs ? [], buildPhase ? "", requiresVRAM ? null, cudaMutexOpts ? " ", ...}@args: pkgs.stdenv.mkDerivation ({
+          name = "${args.name}-wants-cuda";
+          requiredSystemFeatures = requiredSystemFeatures ++ ["cuda"];
           nativeBuildInputs = nativeBuildInputs ++ (with pkgs; [cudaPackages.cuda_cudart cudaPackages.cuda_cccl cudaPackages.cuda_nvcc]);
           buildPhase = if requiresVRAM != null then
           let
@@ -46,34 +47,32 @@
           in ''
             ${self.packages."${system}".cuda_mutex}/bin/cuda_mutex ${requiresVRAM} ${cudaMutexOpts} -- ${origPhase}
           '' else buildPhase;
-        } // pkgs.lib.removeAttrs args ["requiredSystemFeatures" "nativeBuildInputs" "buildPhase" "requiresVRAM" "cudaMutexOpts"]);
+        } // pkgs.lib.removeAttrs args ["name" "requiredSystemFeatures" "nativeBuildInputs" "buildPhase" "requiresVRAM" "cudaMutexOpts"]);
         };
 
-        nixosModules.default = {pkgs, config, ...}: {
+        nixosModules.default = {pkgs, config, lib, ...}: with lib; {
           options = {
             hardware.nvidia.nixaitools = {
-              enable = pkgs.lib.mkOption {
-                type = pkgs.types.bool;
-                default = false;
-                description = "Make modifications necessary for Nix AI tools to work";
-              };
+              enable = mkEnableOption "Make modifications necessary for Nix AI tools to work";
             };
           };
-          config =
-            if config.hardware.nvidia.nixaitools
-            then {
+          config = mkIf config.hardware.nvidia.nixaitools.enable {
               nix.settings.extra-sandbox-paths = [
                 "/tmp/cuda_mutex.lock"
                 "/tmp/cuda_mutex.json"
               ];
 
-              # https://github.com/ogoid/nixos-expose-cuda/tree/master
-              nix.settings.system-features = [ "expose-cuda" ];
-              nix.settings.pre-build-hook = pkgs.writers.writePython3 "nix-pre-build.py" { }
+              systemd.tmpfiles.rules = [
+                "f /tmp/cuda_mutex.lock 0666 root root - -"
+                "f /tmp/cuda_mutex.json 0666 root root - -"
+              ];
+
+              # Based on https://github.com/ogoid/nixos-expose-cuda/tree/master
+              nix.settings.system-features = [ "cuda" ];
+              nix.settings.pre-build-hook = pkgs.writers.writePython3 "nix-pre-build.py" { doCheck = false; }
                 (builtins.readFile ./nix-pre-build-hook.py);
-            }
-            else {};
-        };
+          };
+      };
       };
       perSystem = {system, ...}: let
         pkgs = import inputs.nixpkgs {
