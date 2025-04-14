@@ -17,7 +17,7 @@ Key features:
 
 How it works:
 1. Uses NVML (NVIDIA Management Library) to query GPU memory information
-2. Maintains a shared state file to track reserved VRAM across processes
+2. Maintains a shared state file (using file locking) to track reserved VRAM across processes
 3. Waits until requested VRAM is available before launching the application
 4. Monitors the application's actual VRAM usage in a background thread
 5. If usage exceeds the reservation, dynamically updates the reservation
@@ -31,6 +31,14 @@ This approach ensures maximum GPU utilization without over-allocation, even when
 applications don't instantly allocate their full VRAM requirements. The script accounts
 for the fact that naively checking available VRAM is insufficient, as multiple processes
 might be waiting to allocate memory simultaneously.
+
+# --- Editing Guide ---
+# 1. NVML Init/Shutdown: NVML is initialized once in main() and shutdown via atexit.
+#    Do not add nvmlInit/nvmlShutdown calls to helper functions.
+# 2. Argument Parsing: The script expects 'size' then options, then the command
+#    using argparse.REMAINDER. Do not re-introduce complex separator logic.
+# 3. State Saving: Uses direct write to STATE_FILE under fcntl lock. Do not
+#    re-introduce atomic rename due to permission issues in Nix build env.
 """
 
 import argparse
@@ -48,7 +56,10 @@ from pathlib import Path
 try:
     import pynvml
 except ImportError:
-    print("Error: pynvml library not found. Please install it with 'pip install nvidia-ml-py3'")
+    print("Error: pynvml library not found. Please install it with 'pip install nvidia-ml-py3'", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"Error importing pynvml: {e}", file=sys.stderr)
     sys.exit(1)
 
 # Global constants
@@ -61,7 +72,7 @@ UPDATE_INTERVAL = 1  # seconds
 verbose = False
 quiet = False
 max_vram_usage = 0
-
+nvml_initialized = False # Track NVML state
 
 def parse_size(size_str):
     """Parse a size string like '5G' into bytes."""
@@ -97,41 +108,73 @@ def format_size(size_bytes):
 def log(message):
     """Log a message if verbose mode is enabled."""
     if verbose and not quiet:
-        print(f"[cuda_mutex] {message}")
+        print(f"[cuda_mutex][{os.getpid()}] {message}", file=sys.stderr) # Log to stderr, include PID
 
 
 def message(message):
     """Print a message unless quiet mode is enabled."""
     if not quiet:
-        print(f"[cuda_mutex] {message}")
+        print(f"[cuda_mutex][{os.getpid()}] {message}")
+
+
+def _init_nvml():
+    """Initialize NVML library."""
+    global nvml_initialized
+    if nvml_initialized:
+        return # Already initialized
+    try:
+        pynvml.nvmlInit()
+        nvml_initialized = True
+        log(f"NVML initialized successfully. Driver version: {pynvml.nvmlSystemGetDriverVersion()}")
+    except pynvml.NVMLError as e:
+        print(f"Error: Failed to initialize NVML: {e}", file=sys.stderr)
+        print("Ensure NVIDIA drivers are installed and running.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        # Catch potential bytes decoding errors or other issues during init
+        print(f"Error during NVML initialization: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _shutdown_nvml():
+    """Shutdown NVML library, handling potential errors."""
+    global nvml_initialized
+    if not nvml_initialized:
+        return # Not initialized or already shut down
+    try:
+        pynvml.nvmlShutdown()
+        nvml_initialized = False
+        # Use log here in case shutdown happens before quiet is set, but avoid printing normally
+        if verbose: log("NVML shut down successfully.")
+    except pynvml.NVMLError as e:
+        # Log error but don't exit, as we might be in cleanup phase
+        log(f"Warning: Error shutting down NVML: {e}")
 
 
 def get_available_vram(device_index=0):
-    """Get the total available VRAM in bytes for the specified device."""
-    pynvml.nvmlInit()
-
+    """Get the total available VRAM in bytes for the specified device. Assumes NVML is initialized."""
     try:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
         info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         return info.free
-    finally:
-        pynvml.nvmlShutdown()
+    except pynvml.NVMLError as e:
+        print(f"Error getting available VRAM for device {device_index}: {e}", file=sys.stderr)
+        # Don't exit here, let the caller handle it or retry
+        return None # Indicate error
 
 
 def get_device_count():
-    """Get the number of CUDA devices."""
-    pynvml.nvmlInit()
-
+    """Get the number of CUDA devices. Assumes NVML is initialized."""
     try:
         return pynvml.nvmlDeviceGetCount()
-    finally:
-        pynvml.nvmlShutdown()
+    except pynvml.NVMLError as e:
+        print(f"Error getting device count: {e}", file=sys.stderr)
+        # Don't exit here, let the caller handle it
+        return None # Indicate error
 
 
 def get_device_name(device_index=0):
-    """Get the name of the specified CUDA device."""
-    pynvml.nvmlInit()
-
+    """Get the name of the specified CUDA device. Assumes NVML is initialized."""
     try:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
         name = pynvml.nvmlDeviceGetName(handle)
@@ -139,162 +182,341 @@ def get_device_name(device_index=0):
         if isinstance(name, bytes):
             return name.decode('utf-8')
         return name  # Already a string
-    finally:
-        pynvml.nvmlShutdown()
+    except pynvml.NVMLError as e:
+        print(f"Error getting device name for device {device_index}: {e}", file=sys.stderr)
+        # Return a placeholder instead of exiting
+        return f"Device {device_index} (Error)"
 
 
 def get_process_vram_usage(pid, device_index=0):
-    """Get the VRAM usage of a specific process on the specified device."""
-    pynvml.nvmlInit()
-
+    """Get the VRAM usage of a specific process on the specified device. Assumes NVML is initialized."""
     try:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
-
-        # Get process info
-        process_info = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        # Get process info - use v2 for potentially more info, though v1 is sufficient here
+        try:
+             process_info = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(handle)
+        except pynvml.NVMLError_FunctionNotFound:
+             process_info = pynvml.nvmlDeviceGetComputeRunningProcesses(handle) # Fallback
 
         # Check if our process is using the GPU
         for proc in process_info:
             if proc.pid == pid:
                 return proc.usedGpuMemory
-
         # Process not found in GPU processes
         return 0
-    except Exception as e:
-        log(f"Error getting VRAM usage: {e}")
+    except pynvml.NVMLError_NotFound:
+        # This can happen if the process exits between checks, not necessarily an error
+        log(f"Process {pid} not found running on GPU {device_index}.")
         return 0
-    finally:
-        pynvml.nvmlShutdown()
+    except pynvml.NVMLError_NoPermission:
+        log(f"Permission error getting VRAM usage for PID {pid} on device {device_index}. Check permissions.")
+        return None # Indicate error clearly
+    except pynvml.NVMLError as e:
+        log(f"Error getting VRAM usage for PID {pid} on device {device_index}: {e}")
+        return None # Indicate error clearly
 
 
 def acquire_lock(lock_file):
     """Acquire an exclusive lock on the lock file."""
     os.makedirs(os.path.dirname(lock_file), exist_ok=True)
     lock_fd = open(lock_file, 'w+')
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    return lock_fd
+    try:
+        # Set close-on-exec flag to prevent child process from inheriting the lock fd
+        flags = fcntl.fcntl(lock_fd, fcntl.F_GETFD)
+        fcntl.fcntl(lock_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        # Acquire the lock
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return lock_fd
+    except Exception as e:
+        print(f"Error acquiring lock on {lock_file}: {e}", file=sys.stderr)
+        lock_fd.close() # Ensure file descriptor is closed on error
+        sys.exit(1)
 
 
 def release_lock(lock_fd):
     """Release the lock on the lock file."""
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    lock_fd.close()
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except Exception as e:
+        log(f"Warning: Error releasing lock: {e}") # Log but don't crash
+    finally:
+        # Check if already closed before closing again
+        if lock_fd is not None and not lock_fd.closed:
+             lock_fd.close()
 
 
 def get_state():
-    """Get the current state of reserved VRAM."""
+    """Get the current state of reserved VRAM. Assumes lock is held by caller."""
     if not os.path.exists(STATE_FILE):
-        device_count = get_device_count()
+        log(f"State file {STATE_FILE} not found, creating initial state.")
+        # Attempt to get device count to create initial structure
+        count = get_device_count()
+        if count is None:
+            print("Error: Could not get device count to create initial state. NVML issue?", file=sys.stderr)
+            # Cannot proceed without device count, even if file doesn't exist
+            # Caller should handle this by maybe retrying or exiting.
+            return None # Indicate error
         state = {'devices': {}}
-        for i in range(device_count):
+        for i in range(count):
             state['devices'][str(i)] = {'reserved': 0, 'processes': {}}
+        # Save the newly created state immediately (requires lock, which caller holds)
+        try:
+            save_state(state)
+        except Exception as save_e:
+             log(f"Warning: Failed to save newly created initial state: {save_e}")
+             # Return the in-memory state anyway, maybe saving will work next time
         return state
 
-    with open(STATE_FILE, 'r') as f:
+    try:
+        with open(STATE_FILE, 'r') as f:
+            content = f.read()
+            if not content:
+                 log(f"State file {STATE_FILE} is empty, creating new state.")
+                 count = get_device_count()
+                 if count is None:
+                     print("Error: Could not get device count to re-create empty state. NVML issue?", file=sys.stderr)
+                     return None # Indicate error
+                 state = {'devices': {}}
+                 for i in range(count):
+                     state['devices'][str(i)] = {'reserved': 0, 'processes': {}}
+                 # Try saving the new empty state immediately (caller holds lock)
+                 try:
+                     save_state(state)
+                 except Exception as save_e:
+                     log(f"Warning: Failed to save newly created state (empty file case): {save_e}")
+                 return state
+            return json.loads(content)
+    except json.JSONDecodeError:
+        log(f"Warning: State file {STATE_FILE} corrupted or empty, creating new state.")
+        # If the state file is corrupted, create a new one
+        count = get_device_count()
+        if count is None:
+            print("Error: Could not get device count to re-create corrupted state. NVML issue?", file=sys.stderr)
+            return None # Indicate error
+        state = {'devices': {}}
+        for i in range(count):
+            state['devices'][str(i)] = {'reserved': 0, 'processes': {}}
+        # Try saving the new empty state immediately (caller holds lock)
         try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            # If the state file is corrupted, create a new one
-            device_count = get_device_count()
-            state = {'devices': {}}
-            for i in range(device_count):
-                state['devices'][str(i)] = {'reserved': 0, 'processes': {}}
-            return state
+            save_state(state)
+        except Exception as save_e:
+             log(f"Warning: Failed to save newly created state (corruption case): {save_e}")
+        return state
+    except Exception as e:
+        print(f"Error reading state file {STATE_FILE}: {e}", file=sys.stderr)
+        # Let caller handle the error, return None
+        return None
 
 
 def save_state(state):
-    """Save the state of reserved VRAM to the state file."""
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
+    """
+    Save the state of reserved VRAM directly to the state file.
+    This function MUST be called while holding the file lock.
+    It overwrites the existing file content.
+    """
+    try:
+        # Open with 'w' creates if not exists, or truncates existing file.
+        # The file descriptor needs to be managed carefully, especially with locks.
+        # Opening here might conflict with the lock file descriptor?
+        # Let's write directly to the lock_fd if it's opened appropriately.
+        # No, the lock_fd is on LOCK_FILE, not STATE_FILE.
+        # We rely on the exclusive lock on LOCK_FILE preventing other cuda_mutex
+        # instances from accessing STATE_FILE concurrently.
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+        # No rename needed
+    except Exception as e:
+        # Print error, but don't raise, allowing the caller (who holds the lock)
+        # to potentially continue or handle the failure.
+        print(f"Error saving state file {STATE_FILE}: {e}", file=sys.stderr)
 
 
 def cleanup_state():
     """Cleanup the state by removing entries for processes that no longer exist."""
-    lock_fd = acquire_lock(LOCK_FILE)
+    # This function MUST be called while holding the lock acquired by the caller.
     try:
-        state = get_state()
-        updated = False
+        state = get_state() # Reads state under lock
+        if state is None:
+             log("Error: Could not get state during cleanup.")
+             return # Cannot proceed if state reading failed
 
-        for device_id, device_state in state['devices'].items():
-            for pid_str, vram in list(device_state['processes'].items()):
-                pid = int(pid_str)
+        updated = False
+        pids_to_remove = {} # Store {device_id: [pid1, pid2...]}
+
+        for device_id, device_state in state.get('devices', {}).items():
+            pids_to_remove[device_id] = []
+            # Iterate over a copy of keys since we might modify the dict
+            for pid_str in list(device_state.get('processes', {}).keys()):
                 try:
-                    os.kill(pid, 0)  # Check if process exists
+                    pid = int(pid_str)
+                    os.kill(pid, 0)  # Check if process exists (signal 0 does nothing but check)
+                except ValueError:
+                     log(f"Warning: Invalid PID '{pid_str}' found in state file for device {device_id}. Removing.")
+                     pids_to_remove[device_id].append(pid_str)
+                     updated = True
                 except OSError:
-                    # Process doesn't exist
-                    log(f"Cleaning up process {pid} with {format_size(vram)} VRAM on GPU {device_id}")
-                    del device_state['processes'][pid_str]
-                    device_state['reserved'] -= vram
+                    # Process doesn't exist (errno=ESRCH) or permission denied (errno=EPERM)
+                    # We should clean up in both cases. If we get EPERM, we can't monitor it anyway.
+                    pids_to_remove[device_id].append(pid_str)
                     updated = True
 
+        # Remove dead processes from state
         if updated:
-            save_state(state)
-    finally:
-        release_lock(lock_fd)
+            log("Performing state cleanup for dead/invalid processes...")
+            for device_id, pids in pids_to_remove.items():
+                if device_id in state.get('devices', {}): # Check device still exists
+                    device_state = state['devices'][device_id]
+                    proc_dict = device_state.get('processes', {})
+                    total_reserved = device_state.get('reserved', 0)
+                    for pid_str in pids:
+                        if pid_str in proc_dict:
+                             # Default to 0 if vram value is missing/invalid
+                             vram = proc_dict.get(pid_str, 0)
+                             if not isinstance(vram, (int, float)): vram = 0 # Ensure numeric
+                             log(f"Cleaning up PID {pid_str} ({format_size(vram)}) on GPU {device_id}")
+                             total_reserved -= vram
+                             del proc_dict[pid_str]
+                    # Ensure reserved doesn't go below zero
+                    state['devices'][device_id]['reserved'] = max(0, total_reserved)
+                    state['devices'][device_id]['processes'] = proc_dict # Update processes dict
+
+            save_state(state) # Save the cleaned state (under lock)
+            log("State cleanup finished.")
+        # else: # No need to log this case unless verbose
+        #    log("State cleanup check: No dead processes found.")
+    except Exception as e:
+        # Log the error but don't crash the calling function (often wait_for_vram)
+        log(f"Error during state cleanup: {e}")
 
 
 def reserve_vram(vram_bytes, device_index=0):
     """Reserve VRAM for the current process on the specified device."""
+    # This function acquires its own lock
     pid = os.getpid()
+    pid_str = str(pid)
     device_id = str(device_index)
+    lock_fd = None # Initialize
 
-    lock_fd = acquire_lock(LOCK_FILE)
     try:
-        state = get_state()
+        lock_fd = acquire_lock(LOCK_FILE)
+        state = get_state() # Get current state (under lock)
+        if state is None:
+             raise RuntimeError("Failed to get state during VRAM reservation.")
 
-        if device_id not in state['devices']:
-            state['devices'][device_id] = {'reserved': 0, 'processes': {}}
+        if device_id not in state.get('devices', {}):
+            log(f"Device {device_id} not found in state during reservation, adding.")
+            state.setdefault('devices', {})[device_id] = {'reserved': 0, 'processes': {}}
 
         device_state = state['devices'][device_id]
-        device_state['reserved'] += vram_bytes
-        device_state['processes'][str(pid)] = vram_bytes
+        current_reserved = device_state.get('reserved', 0)
+        current_processes = device_state.get('processes', {})
 
-        save_state(state)
+        # Check if PID already exists (should not happen ideally, but handle defensively)
+        if pid_str in current_processes:
+             log(f"Warning: PID {pid_str} already has a reservation on device {device_id}. Overwriting.")
+             old_vram = current_processes.get(pid_str, 0) # Default to 0
+             if not isinstance(old_vram, (int, float)): old_vram = 0
+             device_state['reserved'] = max(0, current_reserved - old_vram + vram_bytes)
+        else:
+             device_state['reserved'] = max(0, current_reserved) + vram_bytes
+
+        # Ensure values are numeric before saving
+        device_state['reserved'] = int(device_state['reserved'])
+        device_state['processes'] = device_state.get('processes', {}) # Ensure processes dict exists
+        device_state['processes'][pid_str] = int(vram_bytes)
+
+        save_state(state) # Save updated state (under lock)
+        log(f"Reserved {format_size(vram_bytes)} VRAM on GPU {device_id} for PID {pid_str}. Total reserved: {format_size(device_state['reserved'])}")
+    except Exception as e:
+        log(f"Error reserving VRAM: {e}")
+        # Re-raise the exception so the caller knows reservation failed
+        raise
     finally:
+        # Release lock regardless of success/failure within the try block
         release_lock(lock_fd)
 
 
 def update_vram_reservation(old_vram, new_vram, device_index=0):
     """Update the VRAM reservation for the current process."""
+    # This function acquires its own lock
     pid = str(os.getpid())
     device_id = str(device_index)
+    lock_fd = None # Initialize
 
-    lock_fd = acquire_lock(LOCK_FILE)
     try:
-        state = get_state()
+        lock_fd = acquire_lock(LOCK_FILE)
+        state = get_state() # Get state under lock
+        if state is None:
+             log(f"Warning: Failed to get state during VRAM update for PID {pid}. Skipping update.")
+             return # Cannot update if state is unavailable
 
-        if device_id in state['devices']:
+        if device_id in state.get('devices', {}):
             device_state = state['devices'][device_id]
+            current_processes = device_state.get('processes', {})
 
-            if pid in device_state['processes']:
-                device_state['reserved'] -= old_vram
-                device_state['reserved'] += new_vram
-                device_state['processes'][pid] = new_vram
+            if pid in current_processes:
+                current_reserved = device_state.get('reserved', 0)
+                # Use the recorded old_vram value passed to the function for calculation,
+                # not necessarily what's in the file state, as the monitor knows best.
+                diff = new_vram - old_vram
+                new_total_reserved = max(0, current_reserved + diff)
 
-                save_state(state)
+                # Ensure values are numeric
+                device_state['reserved'] = int(new_total_reserved)
+                device_state['processes'][pid] = int(new_vram)
+
+                log(f"Reservation update requested for PID {pid} on GPU {device_id}: {format_size(old_vram)} -> {format_size(new_vram)}. New total reserved: {format_size(new_total_reserved)}")
+                save_state(state) # Save updated state (under lock)
+            else:
+                log(f"Warning: Tried to update VRAM for PID {pid} on GPU {device_id}, but PID not found in state.")
+        else:
+            log(f"Warning: Tried to update VRAM for PID {pid} on GPU {device_id}, but device not found in state.")
+
+    except Exception as e:
+        log(f"Error updating VRAM reservation: {e}")
+        # Optionally re-raise if updates are critical? For now, just log.
     finally:
         release_lock(lock_fd)
 
 
 def release_vram(device_index=0):
     """Release VRAM reserved by the current process on the specified device."""
-    pid = str(os.getpid())
+    # This function acquires its own lock
+    pid_str = str(os.getpid())
     device_id = str(device_index)
+    lock_fd = None # Initialize
 
-    lock_fd = acquire_lock(LOCK_FILE)
     try:
-        state = get_state()
+        lock_fd = acquire_lock(LOCK_FILE)
+        state = get_state() # Get state under lock
+        if state is None:
+             log(f"Warning: Failed to get state during VRAM release for PID {pid_str}. Reservation might remain.")
+             return # Cannot update if state is unavailable
 
-        if device_id in state['devices']:
+        if device_id in state.get('devices', {}):
             device_state = state['devices'][device_id]
+            current_processes = device_state.get('processes', {})
 
-            if pid in device_state['processes']:
-                vram = device_state['processes'][pid]
-                log(f"Releasing {format_size(vram)} VRAM on GPU {device_id}")
-                device_state['reserved'] -= vram
-                del device_state['processes'][pid]
+            if pid_str in current_processes:
+                 # Default to 0 if value is missing/invalid
+                vram = current_processes.get(pid_str, 0)
+                if not isinstance(vram, (int, float)): vram = 0
+                current_reserved = device_state.get('reserved', 0)
+                if not isinstance(current_reserved, (int, float)): current_reserved = 0
+                new_total_reserved = max(0, current_reserved - vram)
 
-                save_state(state)
+                log(f"Releasing {format_size(vram)} VRAM for PID {pid_str} on GPU {device_id}")
+                device_state['reserved'] = int(new_total_reserved)
+                del device_state['processes'][pid_str]
+                log(f"State updated after release for PID {pid_str} on GPU {device_id}: Total reserved {format_size(new_total_reserved)}")
+
+                save_state(state) # Save updated state (under lock)
+            else:
+                 log(f"PID {pid_str} not found in state for GPU {device_id} during release (already released or error?).")
+        else:
+            log(f"Device {device_id} not found in state during release.")
+    except Exception as e:
+        log(f"Error releasing VRAM: {e}")
     finally:
         release_lock(lock_fd)
 
@@ -310,101 +532,181 @@ def wait_for_vram(required_vram, device_index=0, timeout=None, force=False):
         force: If True, run even if there's not enough VRAM available
 
     Returns:
-        True if VRAM is available, False if timeout occurred
+        True if VRAM is available, False if timeout occurred or critical error happens.
     """
     device_id = str(device_index)
     start_time = time.time()
     waiting_message_shown = False
+    device_name = get_device_name(device_index) # Get name once (assumes NVML init)
+    if "Error" in device_name:
+        log(f"Warning: Could not get device name for GPU {device_index}.")
 
     while True:
         # Check timeout
         if timeout is not None and time.time() - start_time > timeout:
-            log(f"Timeout waiting for VRAM on GPU {device_index}")
+            message(f"Timeout ({timeout}s) waiting for {format_size(required_vram)} VRAM on GPU {device_index} ({device_name})")
             return False
 
-        # Clean up state first to remove dead processes
-        cleanup_state()
-
-        # Check available VRAM
-        available_vram = get_available_vram(device_index)
-
-        # Get current reserved VRAM
-        lock_fd = acquire_lock(LOCK_FILE)
+        # --- Critical Section Start ---
+        lock_fd = None # Initialize
+        acquired_vram = False # Flag to indicate success
         try:
-            state = get_state()
+            lock_fd = acquire_lock(LOCK_FILE)
 
-            if device_id not in state['devices']:
-                state['devices'][device_id] = {'reserved': 0, 'processes': {}}
-                save_state(state)
+            # Clean up state first (under lock)
+            cleanup_state() # This now logs errors internally but doesn't raise
 
-            reserved_vram = state['devices'][device_id]['reserved']
+            # Check available VRAM (physical) - MUST check *after* cleanup and *before* checking logical state
+            available_vram = get_available_vram(device_index)
+            if available_vram is None:
+                # Error already printed by get_available_vram
+                message(f"Error getting physical VRAM for GPU {device_index}. Retrying...")
+                # Skip rest of logic in this attempt, will release lock and sleep
+                raise Exception("NVML read error") # Use exception to break out of try
+
+            # Get current reserved VRAM (logical) from potentially updated state
+            state = get_state() # Read state again after cleanup (under lock)
+            if state is None:
+                message(f"Error getting reservation state for GPU {device_index}. Retrying...")
+                raise Exception("State read error") # Use exception to break out
+
+            # Use .get for safer access
+            device_state = state.get('devices', {}).get(device_id, {})
+            reserved_vram = device_state.get('reserved', 0)
+            if not isinstance(reserved_vram, (int, float)): reserved_vram = 0 # Ensure numeric
+            reserved_vram = max(0, int(reserved_vram)) # Ensure non-negative integer
+
+            # Calculate true available VRAM (accounting for reservations)
+            true_available = available_vram - reserved_vram
+
+            log(f"GPU {device_index}: Required={format_size(required_vram)}, "
+                f"Physical Free={format_size(available_vram)}, Reserved={format_size(reserved_vram)}, "
+                f"Logical Free={format_size(true_available)}")
+
+            if true_available >= required_vram:
+                if waiting_message_shown: # Print confirmation if we were waiting
+                     message(f"Sufficient VRAM ({format_size(required_vram)}) now available on GPU {device_index} ({device_name}). Proceeding.")
+                acquired_vram = True # Mark success
+                # Break out of try to release lock and return True
+
+            elif force:
+                message(f"Forcing allocation of {format_size(required_vram)} VRAM on GPU {device_index} ({device_name}) "
+                        f"despite only {format_size(true_available)} being logically available.")
+                acquired_vram = True # Mark success (forced)
+                # Break out of try to release lock and return True
+            else:
+                # Show waiting message only once or periodically
+                if not quiet and not waiting_message_shown:
+                    message(f"Waiting for {format_size(required_vram)} VRAM on GPU {device_index} ({device_name})... "
+                          f"(Phys. Free: {format_size(available_vram)}, "
+                          f"Reserved: {format_size(reserved_vram)}, "
+                          f"Logical Avail: {format_size(true_available)})")
+                    waiting_message_shown = True
+                elif waiting_message_shown and verbose: # Periodically log status if verbose
+                     log(f"Still waiting... Logical Available: {format_size(true_available)}")
+                # Stay in loop, will release lock and sleep
+
+        except Exception as e:
+            log(f"Error during wait loop critical section: {e}. Retrying...")
+            # Fall through to release lock and sleep
         finally:
+            # Ensure lock is always released
             release_lock(lock_fd)
+        # --- Critical Section End ---
 
-        # Calculate true available VRAM (accounting for reservations)
-        true_available = available_vram - reserved_vram
+        if acquired_vram:
+             return True # Return True only if successfully acquired
 
-        if true_available >= required_vram:
-            # Enough VRAM is available
-            return True
-
-        if force:
-            log(f"Forcing allocation of {format_size(required_vram)} VRAM on GPU {device_index} "
-                f"despite only {format_size(true_available)} being available")
-            return True
-
-        # Show waiting message only once
-        if not quiet and not waiting_message_shown:
-            print(f"Waiting for {format_size(required_vram)} VRAM on GPU {device_index} ({get_device_name(device_index)})... "
-                  f"(Available: {format_size(available_vram)}, "
-                  f"Reserved: {format_size(reserved_vram)}, "
-                  f"True Available: {format_size(true_available)})")
-            waiting_message_shown = True
-
-        # Sleep before next check
+        # Sleep before next check if we didn't acquire VRAM
         time.sleep(UPDATE_INTERVAL)
 
 
-def monitor_process_vram(process, required_vram, device_index):
+def monitor_process_vram(process, initial_reservation, device_index, stop_event):
     """
     Monitor the VRAM usage of a process and update the reservation if necessary.
 
     Args:
-        process: The process to monitor
-        required_vram: The initially required VRAM in bytes
+        process: The subprocess.Popen object to monitor
+        initial_reservation: The initially reserved VRAM in bytes
         device_index: CUDA device index
+        stop_event: threading.Event to signal when to stop monitoring
     """
     global max_vram_usage
     pid = process.pid
-    current_reservation = required_vram
+    current_reservation = initial_reservation
+    log(f"Starting VRAM monitor for PID {pid} on GPU {device_index} (initial reservation: {format_size(initial_reservation)})")
 
-    while process.poll() is None:
+    last_usage = 0
+    consecutive_error_count = 0
+    max_error_retry = 5 # Stop trying to update reservation after this many consecutive errors
+
+    while not stop_event.is_set():
+        # Check if process is still running *before* querying NVML
+        exit_code = process.poll()
+        if exit_code is not None:
+            log(f"Process {pid} exited (code: {exit_code}), stopping monitor.")
+            break
+
         # Get actual VRAM usage
         usage = get_process_vram_usage(pid, device_index)
+        if usage is None: # Indicates an error occurred in get_process_vram_usage
+             log(f"Monitor received error getting VRAM usage for PID {pid}, skipping update cycle.")
+             consecutive_error_count += 1
+             if consecutive_error_count > max_error_retry:
+                 log(f"Too many consecutive errors ({consecutive_error_count}) getting VRAM usage for PID {pid}. Stopping reservation updates.")
+                 # Keep monitoring max usage, but stop trying to update state
+                 while not stop_event.is_set():
+                     if process.poll() is not None: break
+                     # Check max usage even if not updating state
+                     current_usage = get_process_vram_usage(pid, device_index)
+                     if current_usage is not None and current_usage > max_vram_usage:
+                         max_vram_usage = current_usage
+                     stop_event.wait(UPDATE_INTERVAL * 5) # Check less frequently
+                 break # Exit main monitor loop
+             stop_event.wait(UPDATE_INTERVAL * (1 + consecutive_error_count)) # Wait longer after error
+             continue
+        else:
+            consecutive_error_count = 0 # Reset error count on success
 
-        # Update max usage
+        # Update max usage seen by this monitor instance
         if usage > max_vram_usage:
             max_vram_usage = usage
-            log(f"Current VRAM usage: {format_size(usage)}")
+            if usage != last_usage: # Log only on change or if verbose
+                 log(f"PID {pid} VRAM usage: {format_size(usage)} (New Max)")
+        elif verbose and usage != last_usage:
+             log(f"PID {pid} VRAM usage: {format_size(usage)}")
+        last_usage = usage
+
 
         # Check if more VRAM is being used than reserved
-        if usage > current_reservation:
-            # Update the reservation
-            message(f"Warning: Process is using {format_size(usage)} VRAM, "
-                   f"which exceeds the reserved {format_size(current_reservation)}")
+        # Add a small buffer (e.g., 1MB) to avoid updates for tiny fluctuations
+        buffer = 1 * 1024 * 1024
+        if usage > current_reservation + buffer:
+            # Calculate new reservation with some headroom (e.g., 10% or 100MB, whichever is larger)
+            headroom = max(int(usage * 0.1), 100 * 1024 * 1024)
+            new_reservation = usage + headroom
 
-            # Calculate new reservation with some headroom (10% extra)
-            new_reservation = int(usage * 1.1)
+            message(f"Warning: PID {pid} using {format_size(usage)} VRAM, "
+                   f"exceeds reserved {format_size(current_reservation)}. Increasing reservation.")
 
-            # Update reservation
+            # Update reservation state (this function handles locking)
+            # Pass the 'current_reservation' known by the monitor as 'old_vram'
             update_vram_reservation(current_reservation, new_reservation, device_index)
-            log(f"Updated reservation from {format_size(current_reservation)} to {format_size(new_reservation)}")
+            # IMPORTANT: Update current reservation for this monitor *only after* successful update call returns
+            # If update_vram_reservation failed (e.g., couldn't get lock/state), we don't update monitor's view
+            # This assumes update_vram_reservation logs errors but doesn't raise them commonly.
+            current_reservation = new_reservation # Assume update succeeded for monitor's logic
+        elif usage < current_reservation * 0.8 and current_reservation > initial_reservation:
+             # Optional: Consider reducing reservation if usage drops significantly?
+             # For simplicity, we currently only increase reservation. Reducing could
+             # lead to thrashing if usage fluctuates.
+             pass
 
-            # Update current reservation
-            current_reservation = new_reservation
 
-        # Sleep before next check
-        time.sleep(UPDATE_INTERVAL)
+        # Sleep before next check, but check stop_event frequently
+        stop_event.wait(UPDATE_INTERVAL)
+
+    log(f"VRAM monitor for PID {pid} stopped. Max observed usage: {format_size(max_vram_usage)}")
 
 
 def run_command(command, required_vram, device_index=0, timeout=None, force=False):
@@ -415,98 +717,256 @@ def run_command(command, required_vram, device_index=0, timeout=None, force=Fals
         command: Command to run (list of strings)
         required_vram: Required VRAM in bytes
         device_index: CUDA device index
-        timeout: Timeout in seconds (None for no timeout)
+        timeout: Timeout in seconds for waiting for VRAM (None for no timeout)
         force: If True, run even if there's not enough VRAM available
     """
     global max_vram_usage
+    max_vram_usage = 0 # Reset max usage for this run
+    process = None # Initialize process variable
+    monitor_thread = None
+    stop_monitor_event = threading.Event()
+    reservation_successful = False # Track if initial reservation succeeded
 
-    # Wait for VRAM to be available
-    if not wait_for_vram(required_vram, device_index, timeout, force):
-        message(f"Timeout waiting for {format_size(required_vram)} VRAM on GPU {device_index}")
-        sys.exit(1)
+    # Get PID early for logging and cleanup context
+    parent_pid = os.getpid()
+    log(f"cuda_mutex process started (PID: {parent_pid})")
 
-    # Reserve VRAM
-    reserve_vram(required_vram, device_index)
-    log(f"Reserved {format_size(required_vram)} VRAM on GPU {device_index} for process")
 
-    # Register cleanup functions
-    atexit.register(lambda: release_vram(device_index))
+    # --- Cleanup Function ---
+    # Defined early to be registered by atexit/signal handlers
+    _cleanup_called = False
+    def cleanup():
+        nonlocal _cleanup_called
+        if _cleanup_called: return # Prevent double execution
+        _cleanup_called = True
 
+        log(f"Running cleanup for cuda_mutex PID {parent_pid}")
+        # Stop the monitor thread gracefully
+        stop_monitor_event.set()
+        if monitor_thread and monitor_thread.is_alive():
+             log("Waiting for monitor thread to finish...")
+             monitor_thread.join(timeout=UPDATE_INTERVAL * 2) # Wait briefly
+             if monitor_thread.is_alive():
+                  log("Monitor thread did not finish promptly.")
+
+        # Try to terminate the child process if it's still running
+        if process and process.poll() is None:
+            child_pid = process.pid
+            log(f"Terminating child process {child_pid}")
+            try:
+                # Send SIGTERM first
+                os.kill(child_pid, signal.SIGTERM)
+                try:
+                    # Wait a short time using os.waitpid for better control
+                    pid_killed, status = os.waitpid(child_pid, os.WNOHANG)
+                    if pid_killed == 0: # Process hasn't exited yet
+                        time.sleep(1.5) # Give it a bit more time
+                        pid_killed, status = os.waitpid(child_pid, os.WNOHANG)
+
+                    if pid_killed == 0: # Still running?
+                        log(f"Child process {child_pid} did not terminate gracefully after SIGTERM, sending SIGKILL.")
+                        os.kill(child_pid, signal.SIGKILL)
+                        os.waitpid(child_pid, 0) # Wait for SIGKILL to take effect
+                except ChildProcessError:
+                     log(f"Child process {child_pid} already exited.") # Already exited
+                except Exception as wait_e:
+                    log(f"Error waiting for child process {child_pid} after SIGTERM: {wait_e}. Attempting SIGKILL.")
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except Exception as kill_e:
+                        log(f"Error sending SIGKILL to child process {child_pid}: {kill_e}")
+
+            except ProcessLookupError:
+                log(f"Child process {child_pid} not found during termination (already exited?).")
+            except Exception as e:
+                log(f"Error terminating child process {child_pid}: {e}")
+
+        # Release VRAM reservation associated with *this* cuda_mutex process
+        if reservation_successful:
+             release_vram(device_index)
+        else:
+             log("Skipping VRAM release because initial reservation did not succeed or was not attempted.")
+
+        log(f"Cleanup finished for cuda_mutex PID {parent_pid}")
+        # NVML shutdown is handled by a separate atexit handler registered *after* this one
+
+
+    # --- Register Cleanup ---
+    atexit.register(cleanup)
+    # Ensure NVML shutdown happens *after* our cleanup (registration order matters)
+    atexit.register(_shutdown_nvml)
+
+    # --- Signal Handling ---
     def signal_handler(sig, frame):
-        log(f"Received signal {sig}, cleaning up")
-        release_vram(device_index)
-        sys.exit(1)
+        signame = signal.Signals(sig).name
+        log(f"Received signal {signame} ({sig}), initiating cleanup via exit...")
+        # Set exit code based on signal
+        sys.exit(128 + sig) # Standard exit code for signals
 
+    # Handle common termination signals
     for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
-        signal.signal(sig, signal_handler)
+        try:
+            signal.signal(sig, signal_handler)
+        except (ValueError, OSError) as e:
+             log(f"Could not register handler for signal {sig}: {e}")
 
-    # Set environment variables to tell the command which GPU to use
-    env = os.environ.copy()
-    env['CUDA_VISIBLE_DEVICES'] = str(device_index)
 
-    # Run the command
+    # --- Main Execution Logic ---
     try:
-        log(f"Running command: {' '.join(command)}")
+        # --- NVML MUST be initialized before waiting or reserving ---
+        _init_nvml() # Initialize NVML for this process instance
+
+        # Wait for VRAM to be available
+        if not wait_for_vram(required_vram, device_index, timeout, force):
+            # wait_for_vram already prints timeout message
+            sys.exit(1) # Exit code 1 for timeout/failure to acquire
+
+        # Reserve VRAM *after* waiting successfully
+        try:
+            reserve_vram(required_vram, device_index)
+            reservation_successful = True # Mark reservation as successful
+        except Exception as reserve_e:
+             print(f"Error: Failed to reserve VRAM after waiting: {reserve_e}", file=sys.stderr)
+             sys.exit(1) # Exit if reservation fails
+
+        # Set environment variables to tell the command which GPU to use
+        env = os.environ.copy()
+        cuda_visible_devices_key = 'CUDA_VISIBLE_DEVICES'
+        current_cvd = env.get(cuda_visible_devices_key, None)
+
+        if current_cvd is None or current_cvd.strip() == "":
+            env[cuda_visible_devices_key] = str(device_index)
+            log(f"Setting {cuda_visible_devices_key}={env[cuda_visible_devices_key]}")
+        else:
+            try:
+                visible_indices = [int(x.strip()) for x in current_cvd.split(',') if x.strip()]
+                if device_index not in visible_indices:
+                     log(f"Warning: {cuda_visible_devices_key} is set to '{current_cvd}' but script was asked to use device {device_index}. "
+                         f"The application might use a different device than intended by cuda_mutex.")
+                     log(f"Respecting existing {cuda_visible_devices_key}='{current_cvd}'. Ensure the target application selects device {device_index} correctly from the visible list.")
+                else:
+                     # Restrict visible devices to only the one we manage
+                     env[cuda_visible_devices_key] = str(device_index)
+                     log(f"Restricting {cuda_visible_devices_key} from '{current_cvd}' to '{env[cuda_visible_devices_key]}' to ensure correct device usage.")
+            except ValueError:
+                log(f"Warning: Could not parse existing {cuda_visible_devices_key}='{current_cvd}'. Leaving it unchanged.")
+
+
+        # Run the command
+        command_str = ' '.join(command) # For logging
+        log(f"Running command: {command_str}")
+        # Use Popen for non-blocking execution needed for monitoring
         process = subprocess.Popen(command, env=env)
+        log(f"Launched child process with PID {process.pid}")
 
         # Start monitoring thread
         monitor_thread = threading.Thread(
             target=monitor_process_vram,
-            args=(process, required_vram, device_index),
-            daemon=True
+            args=(process, required_vram, device_index, stop_monitor_event),
+            daemon=True # Ensure thread exits if main process crashes unexpectedly
         )
         monitor_thread.start()
 
         # Wait for the process to complete
-        process.wait()
+        return_code = process.wait()
+        log(f"Child process {process.pid} finished with return code {return_code}")
 
-        # Give the monitor thread time to do a final check
-        time.sleep(UPDATE_INTERVAL * 2)
+        # Signal monitor to stop and wait briefly for final check / cleanup
+        # Do this *before* calling cleanup manually or letting atexit run
+        stop_monitor_event.set()
+        if monitor_thread.is_alive():
+             monitor_thread.join(timeout=UPDATE_INTERVAL * 2) # Wait for monitor cleanup
 
-        # Report max VRAM usage
+        # Report max VRAM usage (use the global updated by the monitor)
         if max_vram_usage > 0:
-            message(f"Maximum VRAM usage: {format_size(max_vram_usage)} "
-                   f"({(max_vram_usage / required_vram * 100):.1f}% of requested {format_size(required_vram)})")
-    finally:
-        # Release VRAM
-        release_vram(device_index)
+            percentage = (max_vram_usage / required_vram * 100) if required_vram > 0 else 0
+            message(f"Maximum VRAM usage observed for PID {process.pid}: {format_size(max_vram_usage)} "
+                   f"({percentage:.1f}% of requested {format_size(required_vram)})")
+        else:
+             message(f"No significant VRAM usage detected or reported for PID {process.pid}.")
+
+        # Exit with the same return code as the child process
+        # atexit handlers (cleanup, nvml_shutdown) will run automatically now
+        sys.exit(return_code)
+
+    except SystemExit as e:
+        # Catch sys.exit calls to allow atexit handlers to run cleanly
+        # Let atexit handlers run, then exit with the caught code
+        # No need to re-raise, atexit runs on normal sys.exit
+        pass
+    except Exception as e:
+        print(f"Error during cuda_mutex execution: {e}", file=sys.stderr)
+        # Cleanup will be triggered by atexit handlers on implicit exit
+        sys.exit(1) # General error exit code
 
 
 def main():
-    parser = argparse.ArgumentParser(description='CUDA VRAM mutex for running GPU applications')
-    parser.add_argument('size', help='Amount of VRAM to reserve (e.g., 5G, 500M)')
+    parser = argparse.ArgumentParser(
+        description='CUDA VRAM Mutex: Run GPU applications with VRAM reservation.',
+        formatter_class=argparse.RawDescriptionHelpFormatter # Preserve formatting in help
+    )
+    parser.add_argument('size', help='Amount of VRAM to reserve (e.g., 5G, 500M, 10240B)')
     parser.add_argument('-d', '--device', type=int, default=0, help='CUDA device index (default: 0)')
-    parser.add_argument('-t', '--timeout', type=int, help='Timeout in seconds (default: none)')
-    parser.add_argument('-f', '--force', action='store_true', help='Force allocation even if there\'s not enough VRAM')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all non-error output')
-    parser.add_argument('command', nargs='+', help='Command to run')
+    parser.add_argument('-t', '--timeout', type=int, help='Timeout in seconds for waiting for VRAM (default: wait indefinitely)')
+    parser.add_argument('-f', '--force', action='store_true', help='Force run even if required VRAM is not logically available (use with caution!)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging output to stderr')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all non-error messages (overrides verbose)')
+    parser.add_argument('command', nargs=argparse.REMAINDER, help='The command and its arguments to run. Use "--" to separate from cuda_mutex options if needed.')
+
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
 
     args = parser.parse_args()
 
-    # Set global flags
     global verbose, quiet
     verbose = args.verbose
     quiet = args.quiet
 
-    # Parse command (handling the -- separator)
-    if '--' in args.command:
-        separator_index = args.command.index('--')
-        command = args.command[separator_index + 1:]
-    else:
-        command = args.command
+    command_to_run = args.command
+    if not command_to_run:
+        parser.error("No command specified.")
+    if command_to_run and command_to_run[0] == '--':
+        command_to_run = command_to_run[1:]
+        if not command_to_run:
+            parser.error("No command specified after '--'.")
 
-    if not command:
-        parser.error("No command specified")
-
-    # Parse required VRAM
     try:
         required_vram = parse_size(args.size)
+        if required_vram <= 0:
+             parser.error("Required VRAM size must be positive.")
     except ValueError as e:
         parser.error(str(e))
 
-    # Run command
-    run_command(command, required_vram, args.device, args.timeout, args.force)
+    # --- Device Check ---
+    # Temporarily initialize NVML *only if not already initialized* for the check
+    needs_nvml_shutdown_here = False
+    if not nvml_initialized:
+        try:
+            _init_nvml()
+            needs_nvml_shutdown_here = True # Need to shut down if we init'd just for check
+        except SystemExit: # Raised by _init_nvml on critical failure
+             sys.exit(1) # Propagate exit
+        except Exception as init_e:
+             parser.error(f"Failed to initialize NVML for device check: {init_e}")
+
+    try:
+        device_count = get_device_count()
+        if device_count is None:
+             parser.error("Could not get device count. NVML issue?")
+        if not (0 <= args.device < device_count):
+             parser.error(f"Invalid device index {args.device}. System has {device_count} devices (indexed 0 to {device_count - 1}).")
+    except Exception as e:
+        parser.error(f"Could not verify device index: {e}")
+    finally:
+        # Shut down NVML only if we initialized it specifically for this check
+        if needs_nvml_shutdown_here:
+             _shutdown_nvml()
+    # --- End Device Check ---
+
+
+    # Run command - this will handle its own NVML init/shutdown via atexit
+    run_command(command_to_run, required_vram, args.device, args.timeout, args.force)
 
 
 if __name__ == "__main__":
