@@ -4,7 +4,7 @@ import sys
 import os
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Optional
 
 # --- Configuration ---
 CUDA_MARKER = "wants-cuda" # Used as fallback if drv inspection fails
@@ -39,15 +39,12 @@ def safe_resolve(p: Path) -> Path | None:
         if not p.is_symlink() and not p.exists():
              return None
         # strict=True requires the *target* to exist, which is usually what we want
-        # Setting it to False would allow resolving broken symlinks, less useful here.
         resolved = p.resolve(strict=True)
         return resolved
     except (FileNotFoundError, RuntimeError, OSError) as e:
         # Only log warning if it was a symlink, as non-symlink non-existence is handled above
         if p.is_symlink():
              log_warning(f"Could not resolve symlink {p}: {e}")
-        # else: # Non-symlink case, don't warn if simply non-existent
-        #    pass
         return None
 
 def get_store_path_parent(p: Path) -> Path | None:
@@ -72,31 +69,23 @@ def gather_potential_cuda_paths() -> Set[Path]:
     required_store_paths: Set[Path] = set() # Store paths needed based on library targets
 
     # 1. Add device nodes (/dev/nvidia*, /dev/dri/card* etc.)
-    #    We add both the original path and its resolved target if it's a symlink.
     if DEV_DIR.is_dir():
-        # Common patterns for NVIDIA and general DRM devices
-        # Add more patterns if needed for specific hardware/drivers (e.g., /dev/fuse)
         dev_patterns = ["nvidia*", "dri/card*", "dri/renderD*", "nvhost*", "nvmap"]
         log_info(f"Searching for device nodes in {DEV_DIR} matching: {dev_patterns}")
         found_dev_nodes = 0
         for pattern in dev_patterns:
              for p in DEV_DIR.glob(pattern):
-                 # Check if it exists or is a symlink (even if broken initially)
                  if p.exists() or p.is_symlink():
                      abs_p = p.absolute()
-                     # Add original path always (safer for direct references in userspace)
                      all_paths_to_bind.add(abs_p)
                      found_dev_nodes += 1
                      log_info(f"  Adding potential device node: {abs_p}")
-                     # Try to resolve and add target if different (e.g. nvidia0 -> nvidiactl)
-                     resolved_dev = safe_resolve(p) # Use safe_resolve here
+                     resolved_dev = safe_resolve(p)
                      if resolved_dev:
                          abs_resolved = resolved_dev.absolute()
                          if abs_resolved != abs_p:
                              all_paths_to_bind.add(abs_resolved)
                              log_info(f"    -> Also adding resolved target: {abs_resolved}")
-                     # else: # safe_resolve already logs warnings for broken symlinks
-                     #    pass
 
         if found_dev_nodes == 0:
              log_warning(f"No device nodes found matching patterns in {DEV_DIR}. GPU access might fail.")
@@ -104,7 +93,6 @@ def gather_potential_cuda_paths() -> Set[Path]:
         log_warning(f"Device directory not found or not accessible: {DEV_DIR}")
 
     # 2. Add the top-level driver directory/symlink itself (/run/opengl-driver)
-    #    AND its resolved target (if it's a symlink pointing to the store).
     driver_path_added = False
     if OPENGL_DIR.exists() or OPENGL_DIR.is_symlink():
         abs_opengl_dir = OPENGL_DIR.absolute()
@@ -112,72 +100,54 @@ def gather_potential_cuda_paths() -> Set[Path]:
         all_paths_to_bind.add(abs_opengl_dir)
         driver_path_added = True
 
-        # If it's a symlink, resolve it to find the actual driver store path
         if OPENGL_DIR.is_symlink():
             opengl_dir_target = safe_resolve(OPENGL_DIR)
             if opengl_dir_target:
                  abs_target = opengl_dir_target.absolute()
                  log_info(f"  -> Resolved target: {abs_target}")
-                 # Check if the target looks like a top-level store path
                  store_parent = get_store_path_parent(abs_target)
                  if store_parent:
                       log_info(f"  -> Target's store path parent: {store_parent}. Adding to required store paths.")
                       required_store_paths.add(store_parent)
                  else:
-                      # If target isn't a store path, maybe still add it directly?
-                      # This could be /usr/lib/nvidia or similar in non-NixOS. Less critical for Nix builds.
                       log_info(f"  -> Target does not appear to be a Nix store path. Adding target directly just in case.")
                       all_paths_to_bind.add(abs_target)
-            # else: # safe_resolve handles logging failure
-
     else:
         log_warning(f"Driver path {OPENGL_DIR} not found or not accessible. GPU driver libs might be missing.")
 
 
     # 3. Find *additional* required Nix store paths by scanning libs inside the driver path.
-    #    This is crucial because /run/opengl-driver might link to one store path (e.g., for GL),
-    #    but CUDA libs might be in *another* store path, linked from within the first one's lib dir.
     opengl_lib_dir = OPENGL_DIR / "lib" # Standard subdirectory
     if driver_path_added and opengl_lib_dir.is_dir():
         libs_found_count = 0
         resolved_libs_count = 0
         log_info(f"Scanning {opengl_lib_dir} for library symlinks pointing to Nix store...")
-        # Look for common library patterns
         lib_patterns = ["libcuda*", "libnvidia*", "libnv*", "libEGL*", "libGLES*", "libGLX*", "libGL.*", "libvulkan*"]
         for pattern in lib_patterns:
              for p in opengl_lib_dir.glob(pattern):
-                 # Only care about symlinks potentially pointing to the store
                  if p.is_symlink():
                      libs_found_count += 1
-                     target = safe_resolve(p) # Get ultimate target
+                     target = safe_resolve(p)
                      if target:
-                          # Check if the *target library file* is inside the Nix store
                           if target.as_posix().startswith("/nix/store/"):
                              resolved_libs_count += 1
                              store_parent = get_store_path_parent(target)
-                             # Add the *containing store path* (e.g., /nix/store/xxx-nvidia-driver)
                              if store_parent and store_parent not in required_store_paths:
                                  log_info(f"  Identified required store path: {store_parent} (from lib: {p.name} -> {target.name})")
                                  required_store_paths.add(store_parent)
                              elif store_parent:
                                  log_info(f"  Store path {store_parent} already identified (from lib: {p.name})")
-                          # else: # Target is not in store, ignore
-                          #    pass
-                     # else: # safe_resolve handled logging error
 
         log_info(f"Scanned {libs_found_count} library symlinks matching patterns, resolved {resolved_libs_count} to Nix store targets.")
         if not required_store_paths and driver_path_added and OPENGL_DIR.is_symlink():
-             # Check if we already added the main driver target earlier
              main_target_store_path = get_store_path_parent(safe_resolve(OPENGL_DIR)) if safe_resolve(OPENGL_DIR) else None
              if main_target_store_path:
                  log_info(f"No *additional* store paths found via libs, but main driver target {main_target_store_path} was already added.")
              else:
                 log_warning(f"No required Nix store paths identified from libraries in {opengl_lib_dir}. This might be okay or indicate missing links.")
-
     elif driver_path_added:
          log_warning(f"Driver path {OPENGL_DIR} added, but library directory {opengl_lib_dir} not found or not accessible.")
 
-    # Add the combined set of required store paths to the main bind list
     if required_store_paths:
         log_info(f"Adding {len(required_store_paths)} unique required store paths to bind list.")
         all_paths_to_bind.update(required_store_paths)
@@ -186,53 +156,90 @@ def gather_potential_cuda_paths() -> Set[Path]:
     return all_paths_to_bind
 
 
-# --- Derivation Check & Main Execution ---
-def check_derivation_features(drv_path_str: str) -> bool:
-    """Inspects the derivation using 'nix show-derivation' for 'cuda' in requiredSystemFeatures."""
+# --- Derivation Check ---
+def check_derivation_features(drv_path_str: str) -> Optional[bool]:
+    """
+    Inspects the derivation using 'nix show-derivation'.
+    Returns True if 'cuda' is in requiredSystemFeatures.
+    Returns False if 'cuda' is not found after checking known locations.
+    Returns None if an error occurs during inspection that prevents determination.
+    """
     log_info(f"Checking derivation features via '{NIX_CMD} show-derivation {drv_path_str}'")
+    proc = None # Initialize proc for potential use in except block if json.loads fails early
     try:
-        # Correct subprocess call: Use capture_output=True, remove explicit stderr
         proc = subprocess.run(
             [NIX_CMD, "show-derivation", drv_path_str],
             capture_output=True, check=True, text=True, encoding='utf-8'
-            # Removed: stderr=subprocess.PIPE (redundant with capture_output=True)
         )
-        # Output is expected to be a JSON object where keys are derivation paths
         drv_data = json.loads(proc.stdout)
-        # The key might be slightly different (e.g., due to symlinks?), so iterate
         if not drv_data:
             log_error(f"'{NIX_CMD} show-derivation' returned empty JSON data.")
-            return False
+            return None # Error condition
+
         # Assume the first key is the relevant one, usually only one is returned
         actual_drv_path = list(drv_data.keys())[0]
         drv_info = drv_data[actual_drv_path]
 
-        # Navigate the JSON structure to find requiredSystemFeatures
-        features = drv_info.get("env", {}).get("requiredSystemFeatures", [])
+        # drv_info.get("env", {}) ensures env_dict is a dict even if "env" is missing
+        # or not a dict itself.
+        env_dict = drv_info.get("env", {})
+
+        # 1. Check direct 'env.requiredSystemFeatures'
+        #    This is safe as env_dict is guaranteed to be a dict here.
+        features = env_dict.get("requiredSystemFeatures", [])
         if "cuda" in features:
-            log_info(f"Found 'cuda' in requiredSystemFeatures of {actual_drv_path}"); return True
-        else:
-            log_info(f"Did not find 'cuda' in requiredSystemFeatures of {actual_drv_path}"); return False
+            log_info(f"Found 'cuda' in direct requiredSystemFeatures of {actual_drv_path}")
+            return True
+
+        # 2. Check 'env.__json.requiredSystemFeatures' for derivations with __structuredAttrs = true
+        log_info("test")
+        env_json_str = env_dict.get("__json")
+        if isinstance(env_json_str, str):
+            log_info(f"Found __json attribute in env for {actual_drv_path}. Parsing it.")
+            try:
+                structured_env_data = json.loads(env_json_str)
+                # Ensure structured_env_data is a dict before using .get()
+                if isinstance(structured_env_data, dict):
+                    structured_features = structured_env_data.get("requiredSystemFeatures", [])
+                    if "cuda" in structured_features:
+                        log_info(f"Found 'cuda' in requiredSystemFeatures (via __json) of {actual_drv_path}")
+                        return True
+                else:
+                    log_warning(f"Parsed __json content for {actual_drv_path} is not a dictionary. Type: {type(structured_env_data)}")
+                    # If __json is not a dict, we can't find features in it.
+            except json.JSONDecodeError as e:
+                # Log a snippet of the string to help diagnose if it's malformed
+                snippet = env_json_str[:200] + "..." if len(env_json_str) > 200 else env_json_str
+                log_warning(f"Failed to parse __json string for {actual_drv_path}: {e}. Content snippet: '{snippet}'")
+                # If __json parsing fails, "cuda" was not found via this path. Fall through to final 'return False'.
+
+        # If "cuda" was not found by any method after successful inspection of structure
+        log_info(f"Did not find 'cuda' in requiredSystemFeatures of {actual_drv_path} (checked standard and __json paths).")
+        return False
+
     except FileNotFoundError:
-        log_error(f"'{NIX_CMD}' command not found. Ensure Nix is in PATH for the build environment."); return False
+        log_error(f"'{NIX_CMD}' command not found. Ensure Nix is in PATH for the build environment.")
+        return None
     except subprocess.CalledProcessError as e:
         log_error(f"Command '{e.cmd}' failed with exit code {e.returncode}.")
-        # Use captured stderr
         if e.stderr: log_error(f"Nix stderr:\n{e.stderr.strip()}")
-        else: log_error("Nix command produced no stderr.");
-        return False
-    except json.JSONDecodeError as e:
+        else: log_error("Nix command produced no stderr.")
+        return None
+    except json.JSONDecodeError as e: # Handles JSON errors from parsing proc.stdout
         log_error(f"Failed to parse JSON output from 'nix show-derivation': {e}")
-        log_error(f"Raw stdout was:\n{proc.stdout}") # Log raw output for debugging
-        return False
-    except Exception as e:
-        # Catch any other unexpected errors during inspection
-        log_error(f"Unexpected error checking derivation {drv_path_str}: {e}"); return False
+        if proc and hasattr(proc, 'stdout') and proc.stdout:
+             log_error(f"Raw stdout was:\n{proc.stdout}")
+        else:
+             log_error("No raw stdout available or proc not fully initialized for stdout logging.")
+        return None
+    except Exception as e: # Catch-all for other unexpected errors
+        log_error(f"Unexpected error checking derivation {drv_path_str}: {e}")
+        return None
 
+# --- Main Execution ---
 if __name__ == "__main__":
     args = parser.parse_args()
     drv_path_str: str = args.derivation_path
-    # Use Path object for easier handling, though the string is passed to nix command
     drv_path = Path(drv_path_str)
 
     needs_cuda_bindings = False
@@ -241,29 +248,25 @@ if __name__ == "__main__":
     # --- Determine if CUDA bindings are needed ---
     # 1. Preferred method: Inspect the derivation file
     if drv_path.is_file():
-        # Check read permissions before trying to inspect
         if os.access(drv_path, os.R_OK):
             log_info(f"Derivation file found and readable: {drv_path_str}. Checking features.")
-            # Check features, store if successful
             check_result = check_derivation_features(drv_path_str)
-            # Only trust the result if no error occurred during the check
-            if check_result is not None: # Assume function returns None on error now
+            # check_result can be True (found), False (not found), or None (error during check)
+            if check_result is not None:
                  needs_cuda_bindings = check_result
                  checked_features_successfully = True
-            # else: Error already logged by check_derivation_features
+            # else: An error occurred (check_result is None), check_derivation_features already logged.
+            # Fallback will be triggered because checked_features_successfully remains False.
         else:
             log_warning(f"Derivation file found but not readable: {drv_path_str}. Falling back to name check.")
-    # Handle cases where the path exists but isn't a file (unlikely for .drv)
-    elif drv_path.exists():
+    elif drv_path.exists(): # Path exists but is not a file (e.g. a directory)
          log_warning(f"Path exists but is not a file: {drv_path_str}. Falling back to name check.")
-    # Handle case where .drv file doesn't exist (might happen in some build scenarios?)
-    else:
+    else: # Path does not exist
          log_info(f"Derivation file not found: {drv_path_str}. Falling back to name check.")
 
     # 2. Fallback method: Check derivation path *name* for a marker
     if not checked_features_successfully:
         log_info(f"Falling back to checking derivation path name for marker: '{CUDA_MARKER}'.")
-        # Check if the marker string is present anywhere in the derivation path string
         if CUDA_MARKER in drv_path_str:
             log_info(f"Found '{CUDA_MARKER}' marker in path name."); needs_cuda_bindings = True
         else:
@@ -273,42 +276,30 @@ if __name__ == "__main__":
     if needs_cuda_bindings:
         log_info("CUDA bindings determined necessary. Gathering required paths...")
         paths_to_bind = gather_potential_cuda_paths()
-
         valid_binds: List[Tuple[str, str]] = []
+
         if paths_to_bind:
-            # Ensure paths actually exist before adding them to the final list
-            # This prevents errors if, e.g., /dev/nvidia* exists but /dev/nvidia0 is gone
             for p in sorted(list(paths_to_bind), key=lambda x: x.as_posix()):
-                 # Use is_symlink() check too, as we want to bind mount symlinks themselves
-                 # The target will be resolved inside the sandbox if needed.
                  if p.exists() or p.is_symlink():
                      p_str = p.as_posix()
-                     # Bind mount the path to itself (host path = guest path)
-                     valid_binds.append((p_str, p_str))
+                     valid_binds.append((p_str, p_str)) # Bind mount path to itself
                  else:
                      log_warning(f"Skipping non-existent path during final bind list creation: {p}")
         else:
-             # This is a potential problem, GPU access will likely fail
              log_warning("Path gathering resulted in an empty set. No paths will be added to sandbox.")
 
-
         if not valid_binds:
-             # Still exit cleanly, but warn loudly. The build might fail later.
-             log_warning("No valid, existing paths found to bind mount for CUDA/GPU access.")
-             sys.exit(0) # Exit without printing sandbox directives
+             log_warning("No valid, existing paths found to bind mount for CUDA/GPU access. Build might fail if GPU is required.")
+             sys.exit(0) # Exit cleanly, Nix proceeds without extra mounts
 
         # Print the directives for Nix daemon
         log_info(f"Adding {len(valid_binds)} paths to sandbox:")
-        # Use format required by pre-build-hook interface
-        print("extra-sandbox-paths")
+        print("extra-sandbox-paths") # Header for Nix
         for guest_path, host_path in valid_binds:
             log_info(f"  {guest_path} -> {host_path}")
             print(f"{guest_path}={host_path}")
-        # Important: Print a trailing newline after the paths
-        print()
+        print() # Important: Print a trailing newline after the paths
         log_info("Sandbox paths printed successfully.")
-
     else:
         log_info("No CUDA bindings required for this derivation.")
-        # Exit cleanly without printing anything; Nix proceeds without extra mounts
-        sys.exit(0)
+        sys.exit(0) # Exit cleanly, Nix proceeds without extra mounts
